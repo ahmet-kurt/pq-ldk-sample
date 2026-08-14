@@ -8,7 +8,7 @@ use lightning::util::logger::Logger;
 use lightning::util::persist::KVStore;
 use lightning::util::ser::{Readable, WithoutLength, Writeable};
 
-use lightning_persister::fs_store::FilesystemStore;
+use lightning_persister::fs_store::v1::FilesystemStore;
 
 use crate::disk::FilesystemLogger;
 use crate::hex_utils;
@@ -91,7 +91,7 @@ pub(crate) async fn migrate_deprecated_spendable_outputs(
 	}
 
 	let spend_delay = Some(best_block.height + 2);
-	sweeper.track_spendable_outputs(outputs.clone(), None, false, spend_delay).await.unwrap();
+	sweeper.track_spendable_outputs(outputs.clone(), None, None, false, spend_delay).await.unwrap();
 
 	fs::remove_dir_all(&spendables_dir).unwrap();
 	fs::remove_dir_all(&pending_spendables_dir).unwrap();

@@ -12,22 +12,25 @@ use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
 use bitcoin::io;
 use bitcoin::network::Network;
-use bitcoin::BlockHash;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin_bech32::WitnessProgram;
 use disk::{INBOUND_PAYMENTS_FNAME, OUTBOUND_PAYMENTS_FNAME};
+use lightning::blinded_path::message::{BlindedMessagePath, NextMessageHop};
 use lightning::chain::{chainmonitor, ChannelMonitorUpdateStatus};
-use lightning::chain::{BestBlock, Filter};
-use lightning::events::bump_transaction::{BumpTransactionEventHandler, Wallet};
+use lightning::chain::{BlockLocator, Filter};
+use lightning::events::bump_transaction::BumpTransactionEventHandler;
 use lightning::events::{Event, PaymentFailureReason, PaymentPurpose};
 use lightning::ln::channelmanager::{self, RecentPaymentDetails};
 use lightning::ln::channelmanager::{
 	ChainParameters, ChannelManagerReadArgs, PaymentId, SimpleArcChannelManager,
 };
 use lightning::ln::msgs::DecodeError;
+use lightning::ln::msgs::OnionMessage;
 use lightning::ln::peer_handler::{
 	IgnoringMessageHandler, MessageHandler, PeerManager as LdkPeerManager,
 };
 use lightning::ln::types::ChannelId;
+use lightning::offers::static_invoice::StaticInvoice;
 use lightning::onion_message::messenger::{
 	DefaultMessageRouter, OnionMessenger as LdkOnionMessenger,
 };
@@ -46,13 +49,14 @@ use lightning::util::persist::{
 };
 use lightning::util::ser::{Readable, ReadableArgs, Writeable, Writer};
 use lightning::util::sweep as ldk_sweep;
-use lightning::{chain, impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
+use lightning::util::wallet_utils::Wallet;
+use lightning::{chain, impl_ser_tlv_based, impl_ser_tlv_based_enum};
 use lightning_background_processor::{process_events_async, GossipSync, NO_LIQUIDITY_MANAGER};
 use lightning_block_sync::gossip::TokioSpawner;
-use lightning_block_sync::{init, poll, SpvClient, UnboundedCache};
+use lightning_block_sync::{init, poll, HeaderCache, SpvClient};
 use lightning_dns_resolver::OMDomainResolver;
 use lightning_net_tokio::SocketDescriptor;
-use lightning_persister::fs_store::FilesystemStore;
+use lightning_persister::fs_store::v1::FilesystemStore;
 use rand::{thread_rng, Rng};
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryInto;
@@ -73,7 +77,7 @@ pub(crate) enum HTLCStatus {
 	Failed,
 }
 
-impl_writeable_tlv_based_enum!(HTLCStatus,
+impl_ser_tlv_based_enum!(HTLCStatus,
 	(0, Pending) => {},
 	(1, Succeeded) => {},
 	(2, Failed) => {},
@@ -110,7 +114,7 @@ pub(crate) struct PaymentInfo {
 	amt_msat: MillisatAmount,
 }
 
-impl_writeable_tlv_based!(PaymentInfo, {
+impl_ser_tlv_based!(PaymentInfo, {
 	(0, preimage, required),
 	(2, secret, required),
 	(4, status, required),
@@ -121,7 +125,7 @@ pub(crate) struct InboundPaymentInfoStorage {
 	payments: HashMap<PaymentHash, PaymentInfo>,
 }
 
-impl_writeable_tlv_based!(InboundPaymentInfoStorage, {
+impl_ser_tlv_based!(InboundPaymentInfoStorage, {
 	(0, payments, required),
 });
 
@@ -129,7 +133,7 @@ pub(crate) struct OutboundPaymentInfoStorage {
 	payments: HashMap<PaymentId, PaymentInfo>,
 }
 
-impl_writeable_tlv_based!(OutboundPaymentInfoStorage, {
+impl_ser_tlv_based!(OutboundPaymentInfoStorage, {
 	(0, payments, required),
 });
 
@@ -154,7 +158,6 @@ type ChainMonitor = chainmonitor::ChainMonitor<
 pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
 	TokioSpawner,
 	Arc<lightning_block_sync::rpc::RpcClient>,
-	Arc<FilesystemLogger>,
 >;
 
 // Note that if you do not use an `OMDomainResolver` here you should use SimpleArcPeerManager
@@ -185,7 +188,7 @@ type OnionMessenger = LdkOnionMessenger<
 	Arc<DefaultMessageRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>, Arc<KeysManager>>>,
 	Arc<ChannelManager>,
 	Arc<ChannelManager>,
-	Arc<OMDomainResolver<Arc<ChannelManager>>>,
+	Arc<OMDomainResolver<IgnoringMessageHandler>>,
 	IgnoringMessageHandler,
 >;
 
@@ -209,10 +212,23 @@ pub(crate) type OutputSweeper = ldk_sweep::OutputSweeper<
 // Needed due to rust-lang/rust#63033.
 struct OutputSweeperWrapper(Arc<OutputSweeper>);
 
+/// Onion messages we intercepted for offline peers, keyed by the peer to replay them to once it
+/// reconnects. This is what lets us serve an often-offline async payment recipient.
+type InterceptedOmStore = Mutex<StdHashMap<PublicKey, Vec<OnionMessage>>>;
+
+/// The maximum number of onion messages we hold per offline peer before dropping the oldest.
+const MAX_INTERCEPTED_OMS_PER_PEER: usize = 50;
+
+/// Static invoices we persist as a static invoice server on behalf of async recipients, keyed by
+/// the recipient id and invoice slot, together with the path invoice requests are forwarded over.
+type StaticInvoiceStore = Mutex<StdHashMap<(Vec<u8>, u16), (StaticInvoice, BlindedMessagePath)>>;
+
 fn handle_ldk_events<'a>(
 	channel_manager: Arc<ChannelManager>, bitcoind_client: &'a BitcoindClient,
 	network_graph: &'a NetworkGraph, keys_manager: &'a KeysManager,
 	bump_tx_event_handler: &'a BumpTxEventHandler, peer_manager: Arc<PeerManager>,
+	onion_messenger: Arc<OnionMessenger>, intercepted_oms: Arc<InterceptedOmStore>,
+	static_invoices: Arc<StaticInvoiceStore>,
 	inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
 	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
 	output_sweeper: OutputSweeperWrapper, network: Network, event: Event,
@@ -444,8 +460,8 @@ fn handle_ldk_events<'a>(
 				// We don't use the manual invoice payment logic, so this event should never be seen.
 			},
 			Event::PaymentForwarded {
-				prev_channel_id,
-				next_channel_id,
+				prev_htlcs,
+				next_htlcs,
 				total_fee_earned_msat,
 				claim_from_onchain_tx,
 				outbound_amount_forwarded_msat,
@@ -478,6 +494,8 @@ fn handle_ldk_events<'a>(
 						.map(|channel_id| format!(" with channel {}", channel_id))
 						.unwrap_or_default()
 				};
+				let prev_channel_id = prev_htlcs.first().map(|htlc| htlc.channel_id);
+				let next_channel_id = next_htlcs.first().map(|htlc| htlc.channel_id);
 				let from_prev_str = format!(
 					" from {}{}",
 					node_str(&prev_channel_id),
@@ -491,30 +509,32 @@ fn handle_ldk_events<'a>(
 				} else {
 					"from HTLC fulfill message"
 				};
-				let amt_args = if let Some(v) = outbound_amount_forwarded_msat {
-					format!("{}", v)
-				} else {
-					"?".to_string()
-				};
 				if let Some(fee_earned) = total_fee_earned_msat {
 					println!(
 						"\nEVENT: Forwarded payment for {} msat{}{}, earning {} msat {}",
-						amt_args, from_prev_str, to_next_str, fee_earned, from_onchain_str
+						outbound_amount_forwarded_msat,
+						from_prev_str,
+						to_next_str,
+						fee_earned,
+						from_onchain_str
 					);
 				} else {
 					println!(
 						"\nEVENT: Forwarded payment for {} msat{}{}, claiming onchain {}",
-						amt_args, from_prev_str, to_next_str, from_onchain_str
+						outbound_amount_forwarded_msat,
+						from_prev_str,
+						to_next_str,
+						from_onchain_str
 					);
 				}
 				print!("> ");
 				std::io::stdout().flush().unwrap();
 			},
 			Event::HTLCHandlingFailed { .. } => {},
-			Event::SpendableOutputs { outputs, channel_id } => {
+			Event::SpendableOutputs { outputs, channel_id, counterparty_node_id } => {
 				output_sweeper
 					.0
-					.track_spendable_outputs(outputs, channel_id, false, None)
+					.track_spendable_outputs(outputs, channel_id, counterparty_node_id, false, None)
 					.await
 					.unwrap();
 			},
@@ -551,13 +571,126 @@ fn handle_ldk_events<'a>(
 				// the funding transaction either confirms, or this event is generated.
 			},
 			Event::HTLCIntercepted { .. } => {},
-			Event::OnionMessageIntercepted { .. } => {
-				// We don't use the onion message interception feature, so this event should never be
-				// seen.
+			Event::OnionMessageIntercepted { next_hop, message, .. } => {
+				// Hold onion messages destined for an offline peer and replay them when the peer
+				// reconnects, so e.g. a `held_htlc_available` message for an often-offline async
+				// payment recipient is not lost.
+				let next_node_id = match next_hop {
+					NextMessageHop::NodeId(node_id) => Some(node_id),
+					NextMessageHop::ShortChannelId(scid) => channel_manager
+						.list_channels()
+						.iter()
+						.find(|chan| {
+							chan.short_channel_id == Some(scid)
+								|| chan.outbound_scid_alias == Some(scid)
+								|| chan.inbound_scid_alias == Some(scid)
+						})
+						.map(|chan| chan.counterparty.node_id),
+				};
+				match next_node_id {
+					Some(node_id) => {
+						let mut intercepted_oms = intercepted_oms.lock().unwrap();
+						let oms = intercepted_oms.entry(node_id).or_insert_with(Vec::new);
+						if oms.len() >= MAX_INTERCEPTED_OMS_PER_PEER {
+							oms.remove(0);
+						}
+						oms.push(message);
+						println!(
+							"\nEVENT: intercepted an onion message for offline peer {}, holding it for replay",
+							node_id
+						);
+						print!("> ");
+						std::io::stdout().flush().unwrap();
+					},
+					None => {
+						println!("\nEVENT: dropping an intercepted onion message with an unknown next hop");
+						print!("> ");
+						std::io::stdout().flush().unwrap();
+					},
+				}
 			},
-			Event::OnionMessagePeerConnected { .. } => {
-				// We don't use the onion message interception feature, so we have no use for this
-				// event.
+			Event::OnionMessagePeerConnected { peer_node_id } => {
+				let oms = intercepted_oms.lock().unwrap().remove(&peer_node_id);
+				if let Some(oms) = oms {
+					let num_oms = oms.len();
+					for om in oms {
+						if let Err(e) = onion_messenger.forward_onion_message(om, &peer_node_id) {
+							println!(
+								"\nERROR: failed to replay an intercepted onion message to {}: {:?}",
+								peer_node_id, e
+							);
+						}
+					}
+					println!(
+						"\nEVENT: replayed {} held onion message(s) to reconnected peer {}",
+						num_oms, peer_node_id
+					);
+					print!("> ");
+					std::io::stdout().flush().unwrap();
+				}
+			},
+			Event::PersistStaticInvoice {
+				invoice,
+				invoice_request_path,
+				invoice_slot,
+				recipient_id,
+				invoice_persisted_path,
+			} => {
+				static_invoices
+					.lock()
+					.unwrap()
+					.insert((recipient_id.clone(), invoice_slot), (invoice, invoice_request_path));
+				channel_manager.static_invoice_persisted(invoice_persisted_path);
+				println!(
+					"\nEVENT: persisted a static invoice in slot {} for async recipient {}",
+					invoice_slot,
+					String::from_utf8_lossy(&recipient_id)
+				);
+				print!("> ");
+				std::io::stdout().flush().unwrap();
+			},
+			Event::StaticInvoiceRequested {
+				recipient_id,
+				invoice_slot,
+				reply_path,
+				invoice_request,
+			} => {
+				let entry = static_invoices
+					.lock()
+					.unwrap()
+					.get(&(recipient_id.clone(), invoice_slot))
+					.cloned();
+				match entry {
+					Some((invoice, invoice_request_path)) => {
+						let res = channel_manager.respond_to_static_invoice_request(
+							invoice,
+							reply_path,
+							invoice_request,
+							invoice_request_path,
+						);
+						match res {
+							Ok(()) => {
+								println!(
+									"\nEVENT: served the static invoice in slot {} for async recipient {}",
+									invoice_slot,
+									String::from_utf8_lossy(&recipient_id)
+								);
+							},
+							Err(e) => {
+								println!("\nERROR: failed to serve a static invoice: {:?}", e);
+							},
+						}
+					},
+					None => {
+						println!(
+							"\nEVENT: received a static invoice request for unknown recipient {} slot {}",
+							String::from_utf8_lossy(&recipient_id),
+							invoice_slot
+						);
+					},
+				}
+				print!("> ");
+				std::io::stdout().flush().unwrap();
 			},
 			Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event).await,
 			Event::ConnectionNeeded { node_id, addresses } => {
@@ -707,6 +840,7 @@ async fn start_ldk() {
 		persister,
 		Arc::clone(&keys_manager),
 		keys_manager.get_peer_storage_key(),
+		false,
 	));
 
 	// Step 8: Poll for the best chain tip, which may be used by the channel manager & spv client
@@ -743,7 +877,15 @@ async fn start_ldk() {
 	let mut user_config = UserConfig::default();
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
-	user_config.manually_accept_inbound_channels = true;
+	// Forward over unannounced channels too, so this node can be the always-online
+	// channel counterparty of a private async payment recipient.
+	user_config.accept_forwards_to_priv_channels = true;
+	#[cfg(feature = "post-quantum")]
+	{
+		user_config.require_post_quantum_payments = args.pq_require_payments;
+		user_config.build_post_quantum_blinded_paths = args.pq_blinded_paths;
+		user_config.require_post_quantum_inbound = args.pq_require_inbound;
+	}
 	let mut restarting_node = true;
 	let (channel_manager_blockhash, channel_manager) = {
 		if let Ok(f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {
@@ -764,13 +906,12 @@ async fn start_ldk() {
 				user_config,
 				channel_monitor_references,
 			);
-			<(BlockHash, ChannelManager)>::read(&mut BufReader::new(f), read_args).unwrap()
+			<(BlockLocator, ChannelManager)>::read(&mut BufReader::new(f), read_args).unwrap()
 		} else {
 			// We're starting a fresh node.
 			restarting_node = false;
 
-			let polled_best_block = polled_chain_tip.to_best_block();
-			let polled_best_block_hash = polled_best_block.block_hash;
+			let polled_best_block = polled_chain_tip.to_block_locator();
 			let chain_params =
 				ChainParameters { network: args.network, best_block: polled_best_block };
 			let fresh_channel_manager = channelmanager::ChannelManager::new(
@@ -787,7 +928,7 @@ async fn start_ldk() {
 				chain_params,
 				cur.as_secs() as u32,
 			);
-			(polled_best_block_hash, fresh_channel_manager)
+			(polled_best_block, fresh_channel_manager)
 		}
 	};
 
@@ -824,7 +965,7 @@ async fn start_ldk() {
 				logger.clone(),
 			);
 			let mut reader = io::Cursor::new(&mut bytes);
-			<(BestBlock, OutputSweeper)>::read(&mut reader, read_args)
+			<(BlockLocator, OutputSweeper)>::read(&mut reader, read_args)
 				.expect("Failed to deserialize OutputSweeper")
 		},
 		Err(e) => panic!("Failed to read OutputSweeper with {}", e),
@@ -832,11 +973,10 @@ async fn start_ldk() {
 
 	// Step 13: Sync ChannelMonitors, ChannelManager and OutputSweeper to chain tip
 	let mut chain_listener_channel_monitors = Vec::new();
-	let mut cache = UnboundedCache::new();
-	let chain_tip = if restarting_node {
+	let (cache, chain_tip) = if restarting_node {
 		let mut chain_listeners = vec![
 			(channel_manager_blockhash, &channel_manager as &(dyn chain::Listen + Send + Sync)),
-			(sweeper_best_block.block_hash, &output_sweeper as &(dyn chain::Listen + Send + Sync)),
+			(sweeper_best_block, &output_sweeper as &(dyn chain::Listen + Send + Sync)),
 		];
 
 		for (blockhash, channel_monitor) in channelmonitors.drain(..) {
@@ -855,16 +995,11 @@ async fn start_ldk() {
 			));
 		}
 
-		init::synchronize_listeners(
-			bitcoind_client.as_ref(),
-			args.network,
-			&mut cache,
-			chain_listeners,
-		)
-		.await
-		.unwrap()
+		init::synchronize_listeners(bitcoind_client.as_ref(), args.network, chain_listeners)
+			.await
+			.unwrap()
 	} else {
-		polled_chain_tip
+		(HeaderCache::new(), polled_chain_tip)
 	};
 
 	// Step 14: Give ChannelMonitors to ChainMonitor
@@ -878,9 +1013,17 @@ async fn start_ldk() {
 		);
 	}
 
-	// Step 15: Optional: Initialize the P2PGossipSync
-	let gossip_sync =
-		Arc::new(P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger)));
+	// Step 15: Optional: Initialize the P2PGossipSync, verifying announced channels against the
+	// chain via the bitcoind RPC client.
+	let utxo_lookup: Arc<GossipVerifier> = Arc::new(GossipVerifier::new(
+		Arc::clone(&bitcoind_client.bitcoind_rpc_client),
+		TokioSpawner,
+	));
+	let gossip_sync = Arc::new(P2PGossipSync::new(
+		Arc::clone(&network_graph),
+		Some(utxo_lookup),
+		Arc::clone(&logger),
+	));
 
 	// Step 16 an OMDomainResolver as a service to other nodes
 	// As a service to other LDK users, using an `OMDomainResolver` allows others to resolve BIP
@@ -889,21 +1032,27 @@ async fn start_ldk() {
 	// provide you any direct value, but its nice to offer the service for others.
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
 	let resolver = "8.8.8.8:53".to_socket_addrs().unwrap().next().unwrap();
-	let domain_resolver =
-		Arc::new(OMDomainResolver::new(resolver, Some(Arc::clone(&channel_manager))));
+	let domain_resolver = Arc::new(OMDomainResolver::ignoring_incoming_proofs(resolver));
 
 	// Step 17: Initialize the PeerManager
-	let onion_messenger: Arc<OnionMessenger> = Arc::new(OnionMessenger::new(
-		Arc::clone(&keys_manager),
-		Arc::clone(&keys_manager),
-		Arc::clone(&logger),
-		Arc::clone(&channel_manager),
-		Arc::clone(&message_router),
-		Arc::clone(&channel_manager),
-		Arc::clone(&channel_manager),
-		domain_resolver,
-		IgnoringMessageHandler {},
-	));
+	//
+	// We intercept onion messages for offline peers and replay them when the peer reconnects.
+	// This lets this node act as the always-online counterparty of an often-offline async
+	// payment recipient, holding e.g. `held_htlc_available` onion messages until the recipient
+	// comes back online.
+	let onion_messenger: Arc<OnionMessenger> =
+		Arc::new(OnionMessenger::new_with_offline_peer_interception(
+			Arc::clone(&keys_manager),
+			Arc::clone(&keys_manager),
+			Arc::clone(&logger),
+			Arc::clone(&channel_manager),
+			Arc::clone(&message_router),
+			Arc::clone(&channel_manager),
+			Arc::clone(&channel_manager),
+			domain_resolver,
+			IgnoringMessageHandler {},
+			true,
+		));
 	let mut ephemeral_bytes = [0; 32];
 	let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 	rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
@@ -921,15 +1070,6 @@ async fn start_ldk() {
 		logger.clone(),
 		Arc::clone(&keys_manager),
 	));
-
-	// Install a GossipVerifier in in the P2PGossipSync
-	let utxo_lookup = GossipVerifier::new(
-		Arc::clone(&bitcoind_client.bitcoind_rpc_client),
-		TokioSpawner,
-		Arc::clone(&gossip_sync),
-		Arc::clone(&peer_manager),
-	);
-	gossip_sync.add_utxo_lookup(Some(Arc::new(utxo_lookup)));
 
 	// ## Running LDK
 	// Step 18: Initialize networking
@@ -958,6 +1098,35 @@ async fn start_ldk() {
 		}
 	});
 
+	// The hybrid post-quantum BOLT 8 handshake cannot fall back to the classical one, so it runs
+	// on its own dedicated port. Post-quantum peers connect here, classical peers keep using the
+	// port above.
+	#[cfg(feature = "post-quantum")]
+	if let Some(pq_listening_port) = args.pq_listen_port {
+		let peer_manager_connection_handler = peer_manager.clone();
+		let stop_listen = Arc::clone(&stop_listen_connect);
+		tokio::spawn(async move {
+			let listener =
+				tokio::net::TcpListener::bind(format!("[::]:{}", pq_listening_port)).await.expect(
+					"Failed to bind to PQ listen port - is something else already listening on it?",
+				);
+			loop {
+				let peer_mgr = peer_manager_connection_handler.clone();
+				let tcp_stream = listener.accept().await.unwrap().0;
+				if stop_listen.load(Ordering::Acquire) {
+					return;
+				}
+				tokio::spawn(async move {
+					lightning_net_tokio::setup_inbound_pq(
+						peer_mgr.clone(),
+						tcp_stream.into_std().unwrap(),
+					)
+					.await;
+				});
+			}
+		});
+	}
+
 	// Step 19: Connect and Disconnect Blocks
 	let output_sweeper: Arc<OutputSweeper> = Arc::new(output_sweeper);
 	let channel_manager_listener = channel_manager.clone();
@@ -969,7 +1138,7 @@ async fn start_ldk() {
 		let chain_poller = poll::ChainPoller::new(bitcoind_block_source.as_ref(), network);
 		let chain_listener =
 			(chain_monitor_listener, &(channel_manager_listener, output_sweeper_listener));
-		let mut spv_client = SpvClient::new(chain_tip, chain_poller, &mut cache, &chain_listener);
+		let mut spv_client = SpvClient::new(chain_tip, chain_poller, cache, &chain_listener);
 		loop {
 			spv_client.poll_best_tip().await.unwrap();
 			tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1009,6 +1178,8 @@ async fn start_ldk() {
 		.unwrap();
 
 	// Step 20: Handle LDK Events
+	let intercepted_oms: Arc<InterceptedOmStore> = Arc::new(Mutex::new(StdHashMap::new()));
+	let static_invoices: Arc<StaticInvoiceStore> = Arc::new(Mutex::new(StdHashMap::new()));
 	let channel_manager_event_listener = Arc::clone(&channel_manager);
 	let bitcoind_client_event_listener = Arc::clone(&bitcoind_client);
 	let network_graph_event_listener = Arc::clone(&network_graph);
@@ -1017,6 +1188,9 @@ async fn start_ldk() {
 	let outbound_payments_event_listener = Arc::clone(&outbound_payments);
 	let fs_store_event_listener = Arc::clone(&fs_store);
 	let peer_manager_event_listener = Arc::clone(&peer_manager);
+	let onion_messenger_event_listener = Arc::clone(&onion_messenger);
+	let intercepted_oms_event_listener = Arc::clone(&intercepted_oms);
+	let static_invoices_event_listener = Arc::clone(&static_invoices);
 	let output_sweeper_event_listener = Arc::clone(&output_sweeper);
 	let network = args.network;
 	let event_handler = move |event: Event| {
@@ -1029,6 +1203,9 @@ async fn start_ldk() {
 		let outbound_payments_event_listener = Arc::clone(&outbound_payments_event_listener);
 		let fs_store_event_listener = Arc::clone(&fs_store_event_listener);
 		let peer_manager_event_listener = Arc::clone(&peer_manager_event_listener);
+		let onion_messenger_event_listener = Arc::clone(&onion_messenger_event_listener);
+		let intercepted_oms_event_listener = Arc::clone(&intercepted_oms_event_listener);
+		let static_invoices_event_listener = Arc::clone(&static_invoices_event_listener);
 		let output_sweeper_event_listener = Arc::clone(&output_sweeper_event_listener);
 		async move {
 			handle_ldk_events(
@@ -1038,6 +1215,9 @@ async fn start_ldk() {
 				&keys_manager_event_listener,
 				&bump_tx_event_handler,
 				peer_manager_event_listener,
+				onion_messenger_event_listener,
+				intercepted_oms_event_listener,
+				static_invoices_event_listener,
 				inbound_payments_event_listener,
 				outbound_payments_event_listener,
 				fs_store_event_listener,
@@ -1129,6 +1309,8 @@ async fn start_ldk() {
 	// some public channels.
 	let peer_man = Arc::clone(&peer_manager);
 	let chan_man = Arc::clone(&channel_manager);
+	let announced_node_name = args.ldk_announced_node_name;
+	let announced_listen_addr = args.ldk_announced_listen_addr.clone();
 	tokio::spawn(async move {
 		// First wait a minute until we have some peers and maybe have opened a channel.
 		tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1143,8 +1325,8 @@ async fn start_ldk() {
 			if chan_man.list_channels().iter().any(|chan| chan.is_announced) {
 				peer_man.broadcast_node_announcement(
 					[0; 3],
-					args.ldk_announced_node_name,
-					args.ldk_announced_listen_addr.clone(),
+					announced_node_name,
+					announced_listen_addr.clone(),
 				);
 			}
 		}
@@ -1172,6 +1354,8 @@ async fn start_ldk() {
 		inbound_payments,
 		outbound_payments,
 		cli_fs_store,
+		args.ldk_announced_node_name,
+		args.ldk_announced_listen_addr.clone(),
 	));
 
 	// Exit if either CLI polling exits or the background processor exits (which shouldn't happen
@@ -1233,7 +1417,7 @@ pub async fn main() {
 			) {
 			}
 
-			new_action.sa_sigaction = dummy_handler as libc::sighandler_t;
+			new_action.sa_sigaction = dummy_handler as *const () as libc::sighandler_t;
 			new_action.sa_flags = libc::SA_SIGINFO;
 
 			libc::sigaction(

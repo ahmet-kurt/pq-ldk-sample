@@ -8,11 +8,39 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
-	if env::args().len() < 3 {
+	// Split off `--`-style flags so the positional arguments below keep their indices.
+	let mut pq_listen_port: Option<u16> = None;
+	let mut pq_require_payments = false;
+	let mut pq_require_inbound = false;
+	let mut pq_blinded_paths = false;
+	let mut args = Vec::new();
+	for arg in env::args() {
+		if let Some(port) = arg.strip_prefix("--pq-listen-port=") {
+			pq_listen_port = Some(port.parse::<u16>().expect("Failed to parse --pq-listen-port"));
+		} else if arg == "--pq-require-payments" {
+			pq_require_payments = true;
+		} else if arg == "--pq-require-inbound" {
+			pq_require_inbound = true;
+		} else if arg == "--pq-blinded-paths" {
+			pq_blinded_paths = true;
+		} else if arg.starts_with("--") {
+			println!("ERROR: unknown flag {}", arg);
+			return Err(());
+		} else {
+			args.push(arg);
+		}
+	}
+	#[cfg(not(feature = "post-quantum"))]
+	if pq_listen_port.is_some() || pq_require_payments || pq_require_inbound || pq_blinded_paths {
+		println!("ERROR: --pq-* flags require a build with the post-quantum feature");
+		return Err(());
+	}
+
+	if args.len() < 3 {
 		println!("ldk-tutorial-node requires at least 2 arguments: `cargo run [<bitcoind-rpc-username>:<bitcoind-rpc-password>@]<bitcoind-rpc-host>:<bitcoind-rpc-port> ldk_storage_directory_path [<ldk-incoming-peer-listening-port>] [bitcoin-network] [announced-node-name announced-listen-addr*]`");
 		return Err(());
 	}
-	let bitcoind_rpc_info = env::args().skip(1).next().unwrap();
+	let bitcoind_rpc_info = args[1].clone();
 	let bitcoind_rpc_info_parts: Vec<&str> = bitcoind_rpc_info.rsplitn(2, "@").collect();
 
 	// Parse rpc auth after getting network for default .cookie location
@@ -24,10 +52,10 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 	let bitcoind_rpc_host = bitcoind_rpc_path[0].to_string();
 	let bitcoind_rpc_port = bitcoind_rpc_path[1].parse::<u16>().unwrap();
 
-	let ldk_storage_dir_path = env::args().skip(2).next().unwrap();
+	let ldk_storage_dir_path = args[2].clone();
 
 	let mut ldk_peer_port_set = true;
-	let ldk_peer_listening_port: u16 = match env::args().skip(3).next().map(|p| p.parse()) {
+	let ldk_peer_listening_port: u16 = match args.get(3).map(|p| p.parse()) {
 		Some(Ok(p)) => p,
 		Some(Err(_)) => {
 			ldk_peer_port_set = false;
@@ -43,7 +71,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		true => 4,
 		false => 3,
 	};
-	let network: Network = match env::args().skip(arg_idx).next().as_ref().map(String::as_str) {
+	let network: Network = match args.get(arg_idx).map(String::as_str) {
 		Some("testnet") => Network::Testnet,
 		Some("regtest") => Network::Regtest,
 		Some("signet") => Network::Signet,
@@ -69,7 +97,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		return Err(());
 	};
 
-	let ldk_announced_node_name = match env::args().skip(arg_idx + 1).next().as_ref() {
+	let ldk_announced_node_name = match args.get(arg_idx + 1) {
 		Some(s) => {
 			if s.len() > 32 {
 				panic!("Node Alias can not be longer than 32 bytes");
@@ -84,7 +112,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 
 	let mut ldk_announced_listen_addr = Vec::new();
 	loop {
-		match env::args().skip(arg_idx + 1).next().as_ref() {
+		match args.get(arg_idx + 1) {
 			Some(s) => match SocketAddress::from_str(s) {
 				Ok(sa) => {
 					ldk_announced_listen_addr.push(sa);
@@ -106,6 +134,14 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		ldk_announced_listen_addr,
 		ldk_announced_node_name,
 		network,
+		#[cfg(feature = "post-quantum")]
+		pq_listen_port,
+		#[cfg(feature = "post-quantum")]
+		pq_require_payments,
+		#[cfg(feature = "post-quantum")]
+		pq_require_inbound,
+		#[cfg(feature = "post-quantum")]
+		pq_blinded_paths,
 	})
 }
 

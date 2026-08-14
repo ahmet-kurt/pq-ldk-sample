@@ -14,16 +14,16 @@ use bitcoin::hash_types::{BlockHash, Txid};
 use bitcoin::hashes::Hash;
 use bitcoin::key::XOnlyPublicKey;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Network, OutPoint, TxOut, WPubkeyHash};
-use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
-use lightning::events::bump_transaction::{Utxo, WalletSource};
+use bitcoin::{Network, OutPoint, Sequence, TxOut, WPubkeyHash};
+use lightning::chain::chaininterface::{
+	BroadcasterInterface, ConfirmationTarget, FeeEstimator, TransactionType,
+};
 use lightning::log_error;
 use lightning::sign::ChangeDestinationSource;
-use lightning::util::async_poll::AsyncResult;
 use lightning::util::logger::Logger;
-use lightning_block_sync::http::HttpEndpoint;
+use lightning::util::wallet_utils::{Utxo, WalletSource};
 use lightning_block_sync::rpc::RpcClient;
-use lightning_block_sync::{AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource};
+use lightning_block_sync::{BlockData, BlockHeaderData, BlockSource, BlockSourceResult};
 use serde_json;
 use std::collections::HashMap;
 use std::future::Future;
@@ -49,18 +49,20 @@ pub struct BitcoindClient {
 impl BlockSource for BitcoindClient {
 	fn get_header<'a>(
 		&'a self, header_hash: &'a BlockHash, height_hint: Option<u32>,
-	) -> AsyncBlockSourceResult<'a, BlockHeaderData> {
-		Box::pin(async move { self.bitcoind_rpc_client.get_header(header_hash, height_hint).await })
+	) -> impl Future<Output = BlockSourceResult<BlockHeaderData>> + Send + 'a {
+		async move { self.bitcoind_rpc_client.get_header(header_hash, height_hint).await }
 	}
 
 	fn get_block<'a>(
 		&'a self, header_hash: &'a BlockHash,
-	) -> AsyncBlockSourceResult<'a, BlockData> {
-		Box::pin(async move { self.bitcoind_rpc_client.get_block(header_hash).await })
+	) -> impl Future<Output = BlockSourceResult<BlockData>> + Send + 'a {
+		async move { self.bitcoind_rpc_client.get_block(header_hash).await }
 	}
 
-	fn get_best_block<'a>(&'a self) -> AsyncBlockSourceResult<(BlockHash, Option<u32>)> {
-		Box::pin(async move { self.bitcoind_rpc_client.get_best_block().await })
+	fn get_best_block<'a>(
+		&'a self,
+	) -> impl Future<Output = BlockSourceResult<(BlockHash, Option<u32>)>> + Send + 'a {
+		async move { self.bitcoind_rpc_client.get_best_block().await }
 	}
 }
 
@@ -72,10 +74,10 @@ impl BitcoindClient {
 		host: String, port: u16, rpc_user: String, rpc_password: String, network: Network,
 		handle: Handle, logger: Arc<FilesystemLogger>,
 	) -> std::io::Result<Self> {
-		let http_endpoint = HttpEndpoint::for_host(host.clone()).with_port(port);
 		let rpc_credentials =
 			base64::encode(format!("{}:{}", rpc_user.clone(), rpc_password.clone()));
-		let bitcoind_rpc_client = RpcClient::new(&rpc_credentials, http_endpoint);
+		let bitcoind_rpc_client =
+			RpcClient::new(&rpc_credentials, format!("http://{}:{}", host, port));
 		let _dummy = bitcoind_rpc_client
 			.call_method::<BlockchainInfo>("getblockchaininfo", &vec![])
 			.await
@@ -231,9 +233,8 @@ impl BitcoindClient {
 	}
 
 	pub fn get_new_rpc_client(&self) -> RpcClient {
-		let http_endpoint = HttpEndpoint::for_host(self.host.clone()).with_port(self.port);
 		let rpc_credentials = base64::encode(format!("{}:{}", self.rpc_user, self.rpc_password));
-		RpcClient::new(&rpc_credentials, http_endpoint)
+		RpcClient::new(&rpc_credentials, format!("http://{}:{}", self.host, self.port))
 	}
 
 	pub async fn create_raw_transaction(&self, outputs: Vec<HashMap<String, f64>>) -> RawTx {
@@ -322,7 +323,7 @@ impl FeeEstimator for BitcoindClient {
 }
 
 impl BroadcasterInterface for BitcoindClient {
-	fn broadcast_transactions(&self, txs: &[&Transaction]) {
+	fn broadcast_transactions(&self, txs: &[(&Transaction, TransactionType)]) {
 		// As of Bitcoin Core 28, using `submitpackage` allows us to broadcast multiple
 		// transactions at once and have them propagate through the network as a whole, avoiding
 		// some pitfalls with anchor channels where the first transaction doesn't make it into the
@@ -330,7 +331,7 @@ impl BroadcasterInterface for BitcoindClient {
 		// however, so we just use it unconditionally here.
 		// Sadly, Bitcoin Core has an arbitrary restriction on `submitpackage` - it must actually
 		// contain a package (see https://github.com/bitcoin/bitcoin/issues/31085).
-		let txn = txs.iter().map(|tx| encode::serialize_hex(tx)).collect::<Vec<_>>();
+		let txn = txs.iter().map(|(tx, _)| encode::serialize_hex(tx)).collect::<Vec<_>>();
 		let bitcoind_rpc_client = Arc::clone(&self.bitcoind_rpc_client);
 		let logger = Arc::clone(&self.logger);
 		self.main_runtime_handle.spawn(async move {
@@ -350,7 +351,7 @@ impl BroadcasterInterface for BitcoindClient {
 			match res {
 				Ok(_) => {}
 				Err(e) => {
-					let err_str = e.get_ref().unwrap().to_string();
+					let err_str = e.to_string();
 					log_error!(logger,
 						"Warning, failed to broadcast a transaction, this is likely okay but may indicate an error: {}\nTransactions: {:?}",
 						err_str,
@@ -363,14 +364,18 @@ impl BroadcasterInterface for BitcoindClient {
 }
 
 impl ChangeDestinationSource for BitcoindClient {
-	fn get_change_destination_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
-		Box::pin(async move { Ok(self.get_new_address().await.script_pubkey()) })
+	fn get_change_destination_script<'a>(
+		&'a self,
+	) -> impl Future<Output = Result<ScriptBuf, ()>> + Send + 'a {
+		async move { Ok(self.get_new_address().await.script_pubkey()) }
 	}
 }
 
 impl WalletSource for BitcoindClient {
-	fn list_confirmed_utxos<'a>(&'a self) -> AsyncResult<'a, Vec<Utxo>, ()> {
-		Box::pin(async move {
+	fn list_confirmed_utxos<'a>(
+		&'a self,
+	) -> impl Future<Output = Result<Vec<Utxo>, ()>> + Send + 'a {
+		async move {
 			let utxos = self.list_unspent().await.0;
 			Ok(utxos
 				.into_iter()
@@ -394,6 +399,7 @@ impl WalletSource for BitcoindClient {
 									},
 									satisfaction_weight: 1 /* empty script_sig */ * WITNESS_SCALE_FACTOR as u64 +
 										1 /* witness items */ + 1 /* schnorr sig len */ + 64, /* schnorr sig */
+									sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
 								})
 								.ok()
 						},
@@ -401,21 +407,38 @@ impl WalletSource for BitcoindClient {
 					}
 				})
 				.collect())
-		})
+		}
 	}
 
-	fn get_change_script<'a>(&'a self) -> AsyncResult<'a, ScriptBuf, ()> {
-		Box::pin(async move { Ok(self.get_new_address().await.script_pubkey()) })
+	fn get_prevtx<'a>(
+		&'a self, outpoint: OutPoint,
+	) -> impl Future<Output = Result<Transaction, ()>> + Send + 'a {
+		async move {
+			let txid_json = serde_json::json!(outpoint.txid.to_string());
+			let tx_hex = self
+				.bitcoind_rpc_client
+				.call_method::<RawTx>("getrawtransaction", &[txid_json])
+				.await
+				.map_err(|_| ())?;
+			let tx_bytes = hex_utils::to_vec(&tx_hex.0).ok_or(())?;
+			Transaction::consensus_decode(&mut tx_bytes.as_slice()).map_err(|_| ())
+		}
 	}
 
-	fn sign_psbt<'a>(&'a self, tx: Psbt) -> AsyncResult<'a, Transaction, ()> {
-		Box::pin(async move {
+	fn get_change_script<'a>(&'a self) -> impl Future<Output = Result<ScriptBuf, ()>> + Send + 'a {
+		async move { Ok(self.get_new_address().await.script_pubkey()) }
+	}
+
+	fn sign_psbt<'a>(
+		&'a self, tx: Psbt,
+	) -> impl Future<Output = Result<Transaction, ()>> + Send + 'a {
+		async move {
 			let mut tx_bytes = Vec::new();
 			let _ = tx.unsigned_tx.consensus_encode(&mut tx_bytes).map_err(|_| ());
 			let tx_hex = hex_utils::hex_str(&tx_bytes);
 			let signed_tx = self.sign_raw_transaction_with_wallet(tx_hex).await;
 			let signed_tx_bytes = hex_utils::to_vec(&signed_tx.hex).ok_or(())?;
 			Transaction::consensus_decode(&mut signed_tx_bytes.as_slice()).map_err(|_| ())
-		})
+		}
 	}
 }

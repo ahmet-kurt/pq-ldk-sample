@@ -1,5 +1,5 @@
 [package]
-name = "ldk-sample"
+name = "pq-ldk-sample"
 version = "0.1.0"
 authors = ["Valentine Wallace <vwallace@protonmail.com>"]
 license = "MIT OR Apache-2.0"
@@ -7,16 +7,29 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# Enables the hybrid post-quantum (ML-DSA / ML-KEM) surfaces of the underlying
+# rust-lightning fork: gossip and invoice signatures, the BOLT 8 transport
+# handshake on a dedicated port, hybrid payment onions, and post-quantum
+# blinded paths. Without it the node builds and behaves as a vanilla node.
+#
+# The feature is deliberately empty so this manifest also resolves against a
+# vanilla rust-lightning checkout (whose crates have no post-quantum feature).
+# A post-quantum build must enable the dependency features on the command line:
+#
+#   cargo build --features "post-quantum,lightning/post-quantum,lightning-invoice/post-quantum,lightning-net-tokio/post-quantum"
+post-quantum = []
+
 [dependencies]
-lightning = { version = "0.2.0", features = ["dnssec"] }
-lightning-block-sync = { version = "0.2.0", features = [ "rpc-client", "tokio" ] }
-lightning-dns-resolver = { version = "0.3.0" }
-lightning-invoice = { version = "0.34.0" }
-lightning-net-tokio = { version = "0.2.0" }
-lightning-persister = { version = "0.2.0", features = [ "tokio" ] }
-lightning-background-processor = { version = "0.2.0" }
-lightning-rapid-gossip-sync = { version = "0.2.0" }
-lightning-macros = { version = "0.2.0" }
+lightning = { path = "../pq-rust-lightning/lightning", features = ["dnssec"] }
+lightning-block-sync = { path = "../pq-rust-lightning/lightning-block-sync", features = [ "rpc-client", "tokio" ] }
+lightning-dns-resolver = { path = "../pq-rust-lightning/lightning-dns-resolver" }
+lightning-invoice = { path = "../pq-rust-lightning/lightning-invoice" }
+lightning-net-tokio = { path = "../pq-rust-lightning/lightning-net-tokio" }
+lightning-persister = { path = "../pq-rust-lightning/lightning-persister", features = [ "tokio" ] }
+lightning-background-processor = { path = "../pq-rust-lightning/lightning-background-processor" }
+lightning-rapid-gossip-sync = { path = "../pq-rust-lightning/lightning-rapid-gossip-sync" }
+lightning-macros = { path = "../pq-rust-lightning/lightning-macros" }
 
 base64 = "0.13.0"
 bitcoin = "0.32"

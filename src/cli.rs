@@ -8,30 +8,36 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::PublicKey;
+use lightning::blinded_path::message::BlindedMessagePath;
 use lightning::chain::channelmonitor::Balance;
 use lightning::ln::channelmanager::{
-	Bolt11InvoiceParameters, OptionalOfferPaymentParams, PaymentId, RecipientOnionFields, Retry,
+	Bolt11InvoiceParameters, OptionalBolt11PaymentParams, OptionalOfferPaymentParams, PaymentId,
 };
 use lightning::ln::msgs::SocketAddress;
+use lightning::ln::outbound_payment::{RecipientOnionFields, Retry};
 use lightning::ln::types::ChannelId;
 use lightning::offers::offer::{self, Offer};
+use lightning::offers::refund::Refund;
 use lightning::onion_message::dns_resolution::HumanReadableName;
-use lightning::onion_message::messenger::Destination;
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::{PaymentParameters, RouteParameters, RouteParametersConfig};
+#[cfg(feature = "post-quantum")]
+use lightning::sign::NodeSigner;
 use lightning::sign::{EntropySource, KeysManager};
-use lightning::types::payment::{PaymentHash, PaymentPreimage};
+use lightning::types::payment::PaymentPreimage;
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
 use lightning::util::persist::KVStore;
-use lightning::util::ser::Writeable;
+use lightning::util::ser::{Readable, Writeable};
 use lightning_invoice::Bolt11Invoice;
-use lightning_persister::fs_store::FilesystemStore;
+use lightning_persister::fs_store::v1::FilesystemStore;
+#[cfg(feature = "post-quantum")]
+use std::convert::TryInto;
 use std::env;
 use std::io::Write;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -45,6 +51,14 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) ldk_announced_listen_addr: Vec<SocketAddress>,
 	pub(crate) ldk_announced_node_name: [u8; 32],
 	pub(crate) network: Network,
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_listen_port: Option<u16>,
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_require_payments: bool,
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_require_inbound: bool,
+	#[cfg(feature = "post-quantum")]
+	pub(crate) pq_blinded_paths: bool,
 }
 
 pub(crate) async fn poll_for_user_input(
@@ -52,6 +66,7 @@ pub(crate) async fn poll_for_user_input(
 	chain_monitor: Arc<ChainMonitor>, keys_manager: Arc<KeysManager>,
 	network_graph: Arc<NetworkGraph>, inbound_payments: Arc<Mutex<InboundPaymentInfoStorage>>,
 	outbound_payments: Arc<Mutex<OutboundPaymentInfoStorage>>, fs_store: Arc<FilesystemStore>,
+	ldk_announced_node_name: [u8; 32], ldk_announced_listen_addr: Vec<SocketAddress>,
 ) {
 	println!(
 		"LDK startup successful. Enter \"help\" to view available commands. Press Ctrl-D to quit."
@@ -231,74 +246,13 @@ pub(crate) async fn poll_for_user_input(
 						} else {
 							println!("ERROR: Failed to pay: {:?}", pay);
 						}
-					} else if let Ok(hrn) = HumanReadableName::from_encoded(invoice_str) {
-						let random_bytes = keys_manager.get_secure_random_bytes();
-						let payment_id = PaymentId(random_bytes);
-
-						if user_provided_amt.is_none() {
-							println!("Can't pay to a human-readable-name without an amount");
-							continue;
-						}
-
-						// We need some nodes that will resolve DNS for us in order to pay a Human
-						// Readable Name. They don't need to be trusted, but until onion message
-						// forwarding is widespread we'll directly connect to them, revealing who
-						// we intend to pay.
-						let mut dns_resolvers = Vec::new();
-						for (node_id, node) in network_graph.read_only().nodes().unordered_iter() {
-							if let Some(info) = &node.announcement_info {
-								// Sadly, 31 nodes currently squat on the DNS Resolver feature bit
-								// without speaking it.
-								// Its unclear why they're doing so, but none of them currently
-								// also have the onion messaging feature bit set, so here we check
-								// for both.
-								let supports_dns = info.features().supports_dns_resolution();
-								let supports_om = info.features().supports_onion_messages();
-								if supports_dns && supports_om {
-									if let Ok(pubkey) = node_id.as_pubkey() {
-										dns_resolvers.push(Destination::Node(pubkey));
-									}
-								}
-							}
-							if dns_resolvers.len() > 5 {
-								break;
-							}
-						}
-						if dns_resolvers.is_empty() {
-							println!(
-								"Failed to find any DNS resolving nodes, check your network graph is synced"
-							);
-							continue;
-						}
-
-						let amt_msat = user_provided_amt.unwrap();
-						outbound_payments.lock().unwrap().payments.insert(
-							payment_id,
-							PaymentInfo {
-								preimage: None,
-								secret: None,
-								status: HTLCStatus::Pending,
-								amt_msat: MillisatAmount(Some(amt_msat)),
-							},
-						);
-						fs_store
-							.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
-							.await
-							.unwrap();
-
-						let params = OptionalOfferPaymentParams {
-							retry_strategy: Retry::Timeout(Duration::from_secs(10)),
-							..Default::default()
-						};
-						let pay = |a, b, c, d, e| {
-							channel_manager.pay_for_offer_from_human_readable_name(a, b, c, d, e)
-						};
-						let pay = pay(hrn, amt_msat, payment_id, params, dns_resolvers);
-						if pay.is_ok() {
-							println!("Payment in flight");
-						} else {
-							println!("ERROR: Failed to pay");
-						}
+					} else if HumanReadableName::from_encoded(invoice_str).is_ok() {
+						// Paying to a human readable name now requires resolving it into an
+						// `OfferFromHrn` externally (e.g. via the bitcoin-payment-instructions
+						// crate) and calling `pay_for_offer_from_hrn`, which this sample no
+						// longer wires up.
+						println!("ERROR: paying human readable names is not supported");
+						continue;
 					} else {
 						match Bolt11Invoice::from_str(invoice_str) {
 							Ok(invoice) => {
@@ -408,6 +362,15 @@ pub(crate) async fn poll_for_user_input(
 						continue;
 					}
 
+					let pq_omit_pubkey = match words.next() {
+						Some("--pq-omit-pubkey") => true,
+						Some(flag) => {
+							println!("ERROR: getinvoice got unknown flag {}", flag);
+							continue;
+						},
+						None => false,
+					};
+
 					let write_future = {
 						let mut inbound_payments = inbound_payments.lock().unwrap();
 						get_invoice(
@@ -415,10 +378,220 @@ pub(crate) async fn poll_for_user_input(
 							&mut inbound_payments,
 							&channel_manager,
 							expiry_secs.unwrap(),
+							pq_omit_pubkey,
 						);
 						fs_store.write("", "", INBOUND_PAYMENTS_FNAME, inbound_payments.encode())
 					};
 					write_future.await.unwrap();
+				},
+				"getrefund" => {
+					let amt_msat: u64 = match words.next().map(|a| a.parse()) {
+						Some(Ok(amt)) => amt,
+						_ => {
+							println!("ERROR: getrefund requires an amount in millisatoshis and an expiry in seconds: `getrefund <amt_msats> <expiry_secs>`");
+							continue;
+						},
+					};
+					let expiry_secs: u64 = match words.next().map(|e| e.parse()) {
+						Some(Ok(expiry)) => expiry,
+						_ => {
+							println!("ERROR: getrefund requires an expiry in seconds: `getrefund <amt_msats> <expiry_secs>`");
+							continue;
+						},
+					};
+					let payment_id = PaymentId(keys_manager.get_secure_random_bytes());
+					let absolute_expiry = SystemTime::now()
+						.duration_since(SystemTime::UNIX_EPOCH)
+						.unwrap() + Duration::from_secs(expiry_secs);
+					let refund = match channel_manager.create_refund_builder(
+						amt_msat,
+						absolute_expiry,
+						payment_id,
+						Retry::Timeout(Duration::from_secs(10)),
+						RouteParametersConfig::default(),
+					) {
+						Ok(builder) => match builder.build() {
+							Ok(refund) => refund,
+							Err(e) => {
+								println!("ERROR: Failed to build refund: {:?}", e);
+								continue;
+							},
+						},
+						Err(e) => {
+							println!("ERROR: Failed to initiate refund building: {:?}", e);
+							continue;
+						},
+					};
+					outbound_payments.lock().unwrap().payments.insert(
+						payment_id,
+						PaymentInfo {
+							preimage: None,
+							secret: None,
+							status: HTLCStatus::Pending,
+							amt_msat: MillisatAmount(Some(amt_msat)),
+						},
+					);
+					fs_store
+						.write("", "", OUTBOUND_PAYMENTS_FNAME, outbound_payments.encode())
+						.await
+						.unwrap();
+					println!("SUCCESS: generated refund, we will pay the invoice it draws");
+					println!("{}", refund);
+				},
+				"claimrefund" => {
+					let refund_str = match words.next() {
+						Some(refund) => refund,
+						None => {
+							println!("ERROR: claimrefund requires a refund string: `claimrefund <refund>`");
+							continue;
+						},
+					};
+					let refund = match Refund::from_str(refund_str) {
+						Ok(refund) => refund,
+						Err(e) => {
+							println!("ERROR: invalid refund: {:?}", e);
+							continue;
+						},
+					};
+					match channel_manager.request_refund_payment(&refund) {
+						Ok(invoice) => {
+							let payment_hash = invoice.payment_hash();
+							inbound_payments.lock().unwrap().payments.insert(
+								payment_hash,
+								PaymentInfo {
+									preimage: None,
+									secret: None,
+									status: HTLCStatus::Pending,
+									amt_msat: MillisatAmount(Some(invoice.amount_msats())),
+								},
+							);
+							fs_store
+								.write("", "", INBOUND_PAYMENTS_FNAME, inbound_payments.encode())
+								.await
+								.unwrap();
+							println!(
+								"SUCCESS: sent invoice for refund of {} msat with payment hash {}, awaiting payment",
+								invoice.amount_msats(),
+								payment_hash
+							);
+						},
+						Err(e) => {
+							println!("ERROR: failed to request refund payment: {:?}", e);
+						},
+					}
+				},
+				"asyncpaths" => {
+					let recipient_id = match words.next() {
+						Some(id) => id.as_bytes().to_vec(),
+						None => {
+							println!("ERROR: asyncpaths requires a recipient id: `asyncpaths <recipient_id>`");
+							continue;
+						},
+					};
+					match channel_manager.blinded_paths_for_async_recipient(recipient_id, None) {
+						Ok(paths) => {
+							let path_hexes = paths
+								.iter()
+								.map(|path| hex_utils::hex_str(&path.encode()))
+								.collect::<Vec<_>>();
+							println!("SUCCESS: paths for the async recipient to hand to `setasyncserver`:");
+							println!("{}", path_hexes.join(" "));
+						},
+						Err(()) => {
+							println!("ERROR: failed to create async recipient paths, do we have connected peers?");
+						},
+					}
+				},
+				"setasyncserver" => {
+					let mut paths = Vec::new();
+					for path_hex in words.by_ref() {
+						let path = hex_utils::to_vec(path_hex)
+							.and_then(|bytes| BlindedMessagePath::read(&mut &bytes[..]).ok());
+						match path {
+							Some(path) => paths.push(path),
+							None => {
+								println!("ERROR: couldn't parse blinded message path hex");
+								paths.clear();
+								break;
+							},
+						}
+					}
+					if paths.is_empty() {
+						println!("ERROR: setasyncserver requires paths from the server's `asyncpaths`: `setasyncserver <path_hex>...`");
+						continue;
+					}
+					match channel_manager.set_paths_to_static_invoice_server(paths) {
+						Ok(()) => {
+							println!("SUCCESS: static invoice server paths set, building an async receive offer with the server");
+						},
+						Err(()) => {
+							println!("ERROR: failed to set static invoice server paths");
+						},
+					}
+				},
+				"getasyncoffer" => match channel_manager.get_async_receive_offer() {
+					Ok(offer) => println!("{}", offer),
+					Err(()) => {
+						println!("ERROR: no async receive offer ready yet, run `setasyncserver` and wait for the server exchange");
+					},
+				},
+				#[cfg(feature = "post-quantum")]
+				"connectpeerpq" => {
+					let peer_pubkey_and_ip_addr = words.next();
+					if peer_pubkey_and_ip_addr.is_none() {
+						println!("ERROR: connectpeerpq requires peer connection info: `connectpeerpq pubkey@host:port [kem_key_hex]`");
+						continue;
+					}
+					let (pubkey, peer_addr) =
+						match parse_peer_info(peer_pubkey_and_ip_addr.unwrap().to_string()) {
+							Ok(info) => info,
+							Err(e) => {
+								println!("{:?}", e.into_inner().unwrap());
+								continue;
+							},
+						};
+					// The responder's static ML-KEM key either comes in hex out of band or from
+					// the key we pinned from the peer's gossip.
+					let kem_key = match words.next() {
+						Some(kem_hex) => {
+							let kem_vec = hex_utils::to_vec(kem_hex);
+							match kem_vec.and_then(|v| v.try_into().ok()) {
+								Some(key) => key,
+								None => {
+									println!("ERROR: couldn't parse kem_key_hex as an ML-KEM encapsulation key");
+									continue;
+								},
+							}
+						},
+						None => {
+							let pinned = network_graph
+								.read_only()
+								.node(&NodeId::from_pubkey(&pubkey))
+								.and_then(|node| node.pq_kem_node_id());
+							match pinned {
+								Some(key) => key,
+								None => {
+									println!("ERROR: no ML-KEM key pinned for peer from gossip, pass kem_key_hex explicitly");
+									continue;
+								},
+							}
+						},
+					};
+					if peer_manager.peer_by_node_id(&pubkey).is_some() {
+						println!("ERROR: already connected to peer {}, disconnect first", pubkey);
+						continue;
+					}
+					if do_connect_peer_pq(pubkey, kem_key, peer_addr, peer_manager.clone())
+						.await
+						.is_ok()
+					{
+						println!(
+							"SUCCESS: connected to peer {} over post-quantum transport",
+							pubkey
+						);
+					} else {
+						println!("ERROR: failed to connect to peer over post-quantum transport");
+					}
 				},
 				"connectpeer" => {
 					let peer_pubkey_and_ip_addr = words.next();
@@ -544,10 +717,29 @@ pub(crate) async fn poll_for_user_input(
 
 					force_close_channel(channel_id, peer_pubkey, channel_manager.clone());
 				},
-				"nodeinfo" => {
-					node_info(&channel_manager, &chain_monitor, &peer_manager, &network_graph)
-				},
+				"nodeinfo" => node_info(
+					&channel_manager,
+					&chain_monitor,
+					&peer_manager,
+					&network_graph,
+					&keys_manager,
+				),
 				"listpeers" => list_peers(peer_manager.clone()),
+				"listnodes" => list_nodes(&network_graph),
+				"announce" => {
+					// Broadcast our node_announcement now instead of waiting for the periodic
+					// timer, useful when testing gossip propagation.
+					if channel_manager.list_channels().iter().any(|chan| chan.is_announced) {
+						peer_manager.broadcast_node_announcement(
+							[0; 3],
+							ldk_announced_node_name,
+							ldk_announced_listen_addr.clone(),
+						);
+						println!("SUCCESS: broadcast node announcement");
+					} else {
+						println!("ERROR: no announced channels, the announcement would not relay");
+					}
+				},
 				"signmessage" => {
 					const MSG_STARTPOS: usize = "signmessage".len() + 1;
 					if line.trim().as_bytes().len() <= MSG_STARTPOS {
@@ -586,6 +778,8 @@ fn help() {
 	println!("      listchannels");
 	println!("\n  Peers:");
 	println!("      connectpeer pubkey@host:port");
+	#[cfg(feature = "post-quantum")]
+	println!("      connectpeerpq pubkey@host:port [kem_key_hex]");
 	println!("      disconnectpeer <peer_pubkey>");
 	println!("      listpeers");
 	println!("\n  Payments:");
@@ -593,19 +787,43 @@ fn help() {
 	println!("      keysend <dest_pubkey> <amt_msats>");
 	println!("      listpayments");
 	println!("\n  Invoices:");
+	#[cfg(not(feature = "post-quantum"))]
 	println!("      getinvoice <amt_msats> <expiry_secs>");
+	#[cfg(feature = "post-quantum")]
+	println!("      getinvoice <amt_msats> <expiry_secs> [--pq-omit-pubkey]");
 	println!("      getoffer [<amt_msats>]");
+	println!("\n  Refunds:");
+	println!("      getrefund <amt_msats> <expiry_secs>");
+	println!("      claimrefund <refund>");
+	println!("\n  Async payments:");
+	println!("      asyncpaths <recipient_id>\t(static invoice server side)");
+	println!("      setasyncserver <path_hex>...\t(async recipient side)");
+	println!("      getasyncoffer\t(async recipient side)");
 	println!("\n  Other:");
 	println!("      signmessage <message>");
 	println!("      nodeinfo");
+	println!("      listnodes");
+	println!("      announce");
 }
 
 fn node_info(
 	channel_manager: &Arc<ChannelManager>, chain_monitor: &Arc<ChainMonitor>,
 	peer_manager: &Arc<PeerManager>, network_graph: &Arc<NetworkGraph>,
+	keys_manager: &Arc<KeysManager>,
 ) {
 	println!("\t{{");
 	println!("\t\t node_pubkey: {}", channel_manager.get_our_node_id());
+	#[cfg(feature = "post-quantum")]
+	{
+		if let Some(pq_node_id) = keys_manager.get_pq_node_id() {
+			println!("\t\t pq_node_id: {}", hex_utils::hex_str(&pq_node_id));
+		}
+		if let Some(pq_kem_node_id) = keys_manager.get_pq_kem_node_id() {
+			println!("\t\t pq_kem_node_id: {}", hex_utils::hex_str(&pq_kem_node_id));
+		}
+	}
+	#[cfg(not(feature = "post-quantum"))]
+	let _ = keys_manager;
 	let chans = channel_manager.list_channels();
 	println!("\t\t num_channels: {}", chans.len());
 	println!("\t\t num_usable_channels: {}", chans.iter().filter(|c| c.is_usable).count());
@@ -647,6 +865,24 @@ fn list_peers(peer_manager: Arc<PeerManager>) {
 		println!("\t\t pubkey: {}", peer_details.counterparty_node_id);
 	}
 	println!("\t}},");
+}
+
+fn list_nodes(network_graph: &Arc<NetworkGraph>) {
+	print!("[");
+	let graph_lock = network_graph.read_only();
+	for (node_id, node_info) in graph_lock.nodes().unordered_iter() {
+		println!("");
+		println!("\t{{");
+		println!("\t\tnode_id: {},", node_id);
+		println!("\t\thas_announcement: {},", node_info.announcement_info.is_some());
+		#[cfg(feature = "post-quantum")]
+		{
+			println!("\t\tpq_pinned: {},", node_info.pq_node_id().is_some());
+			println!("\t\tpq_kem_pinned: {},", node_info.pq_kem_node_id().is_some());
+		}
+		println!("\t}},");
+	}
+	println!("]");
 }
 
 fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<NetworkGraph>) {
@@ -766,6 +1002,35 @@ pub(crate) async fn do_connect_peer(
 	}
 }
 
+#[cfg(feature = "post-quantum")]
+async fn do_connect_peer_pq(
+	pubkey: PublicKey, kem_key: [u8; lightning::ln::peer_handler::PQ_KEM_EK_LEN],
+	peer_addr: SocketAddr, peer_manager: Arc<PeerManager>,
+) -> Result<(), ()> {
+	match lightning_net_tokio::connect_outbound_pq(
+		Arc::clone(&peer_manager),
+		pubkey,
+		kem_key,
+		peer_addr,
+	)
+	.await
+	{
+		Some(connection_closed_future) => {
+			let mut connection_closed_future = Box::pin(connection_closed_future);
+			loop {
+				tokio::select! {
+					_ = &mut connection_closed_future => return Err(()),
+					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+				};
+				if peer_manager.peer_by_node_id(&pubkey).is_some() {
+					return Ok(());
+				}
+			}
+		},
+		None => Err(()),
+	}
+}
+
 fn do_disconnect_peer(
 	pubkey: bitcoin::secp256k1::PublicKey, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>,
@@ -822,7 +1087,7 @@ async fn send_payment(
 	channel_manager: &ChannelManager, invoice: &Bolt11Invoice, required_amount_msat: Option<u64>,
 	outbound_payments: &Mutex<OutboundPaymentInfoStorage>, fs_store: &FilesystemStore,
 ) {
-	let payment_id = PaymentId((*invoice.payment_hash()).to_byte_array());
+	let payment_id = PaymentId(invoice.payment_hash().0);
 	let payment_secret = Some(*invoice.payment_secret());
 	let amt_msat = match (invoice.amount_milli_satoshis(), required_amount_msat) {
 		// pay_for_bolt11_invoice only validates that the amount we pay is >= the invoice's
@@ -859,15 +1124,18 @@ async fn send_payment(
 	};
 	write_future.await.unwrap();
 
+	let optional_params = OptionalBolt11PaymentParams {
+		retry_strategy: Retry::Timeout(Duration::from_secs(10)),
+		..Default::default()
+	};
 	match channel_manager.pay_for_bolt11_invoice(
 		invoice,
 		payment_id,
 		required_amount_msat,
-		RouteParametersConfig::default(),
-		Retry::Timeout(Duration::from_secs(10)),
+		optional_params,
 	) {
 		Ok(_) => {
-			let payee_pubkey = invoice.recover_payee_pub_key();
+			let payee_pubkey = invoice.get_payee_pub_key();
 			println!("EVENT: initiated sending {} msats to {}", amt_msat, payee_pubkey);
 			print!("> ");
 		},
@@ -912,7 +1180,7 @@ async fn keysend<E: EntropySource>(
 	write_future.await.unwrap();
 	match channel_manager.send_spontaneous_payment(
 		Some(payment_preimage),
-		RecipientOnionFields::spontaneous_empty(),
+		RecipientOnionFields::spontaneous_empty(amt_msat),
 		payment_id,
 		route_params,
 		Retry::Timeout(Duration::from_secs(10)),
@@ -937,11 +1205,17 @@ async fn keysend<E: EntropySource>(
 
 fn get_invoice(
 	amt_msat: u64, inbound_payments: &mut InboundPaymentInfoStorage,
-	channel_manager: &ChannelManager, expiry_secs: u32,
+	channel_manager: &ChannelManager, expiry_secs: u32, pq_omit_pubkey: bool,
 ) {
 	let mut invoice_params: Bolt11InvoiceParameters = Default::default();
 	invoice_params.amount_msats = Some(amt_msat);
 	invoice_params.invoice_expiry_delta_secs = Some(expiry_secs);
+	#[cfg(feature = "post-quantum")]
+	{
+		invoice_params.pq_omit_pubkey = pq_omit_pubkey;
+	}
+	#[cfg(not(feature = "post-quantum"))]
+	let _ = pq_omit_pubkey;
 	let invoice = match channel_manager.create_bolt11_invoice(invoice_params) {
 		Ok(inv) => {
 			println!("SUCCESS: generated invoice: {}", inv);
@@ -953,7 +1227,7 @@ fn get_invoice(
 		},
 	};
 
-	let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
+	let payment_hash = invoice.payment_hash();
 	inbound_payments.payments.insert(
 		payment_hash,
 		PaymentInfo {

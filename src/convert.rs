@@ -9,8 +9,8 @@ pub struct FundedTx {
 }
 
 impl TryInto<FundedTx> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<FundedTx> {
+	type Error = String;
+	fn try_into(self) -> Result<FundedTx, Self::Error> {
 		Ok(FundedTx {
 			changepos: self.0["changepos"].as_i64().unwrap(),
 			hex: self.0["hex"].as_str().unwrap().to_string(),
@@ -21,8 +21,8 @@ impl TryInto<FundedTx> for JsonResponse {
 pub struct RawTx(pub String);
 
 impl TryInto<RawTx> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<RawTx> {
+	type Error = String;
+	fn try_into(self) -> Result<RawTx, Self::Error> {
 		Ok(RawTx(self.0.as_str().unwrap().to_string()))
 	}
 }
@@ -33,8 +33,8 @@ pub struct SignedTx {
 }
 
 impl TryInto<SignedTx> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<SignedTx> {
+	type Error = String;
+	fn try_into(self) -> Result<SignedTx, Self::Error> {
 		Ok(SignedTx {
 			hex: self.0["hex"].as_str().unwrap().to_string(),
 			complete: self.0["complete"].as_bool().unwrap(),
@@ -44,8 +44,8 @@ impl TryInto<SignedTx> for JsonResponse {
 
 pub struct NewAddress(pub String);
 impl TryInto<NewAddress> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<NewAddress> {
+	type Error = String;
+	fn try_into(self) -> Result<NewAddress, Self::Error> {
 		Ok(NewAddress(self.0.as_str().unwrap().to_string()))
 	}
 }
@@ -56,8 +56,8 @@ pub struct FeeResponse {
 }
 
 impl TryInto<FeeResponse> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<FeeResponse> {
+	type Error = String;
+	fn try_into(self) -> Result<FeeResponse, Self::Error> {
 		let errored = !self.0["errors"].is_null();
 		Ok(FeeResponse {
 			errored,
@@ -80,8 +80,8 @@ pub struct MempoolMinFeeResponse {
 }
 
 impl TryInto<MempoolMinFeeResponse> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<MempoolMinFeeResponse> {
+	type Error = String;
+	fn try_into(self) -> Result<MempoolMinFeeResponse, Self::Error> {
 		let errored = !self.0["errors"].is_null();
 		assert_eq!(self.0["maxmempool"].as_u64(), Some(300000000));
 		Ok(MempoolMinFeeResponse {
@@ -106,8 +106,8 @@ pub struct BlockchainInfo {
 }
 
 impl TryInto<BlockchainInfo> for JsonResponse {
-	type Error = std::io::Error;
-	fn try_into(self) -> std::io::Result<BlockchainInfo> {
+	type Error = String;
+	fn try_into(self) -> Result<BlockchainInfo, Self::Error> {
 		Ok(BlockchainInfo {
 			latest_height: self.0["blocks"].as_u64().unwrap() as usize,
 			latest_blockhash: BlockHash::from_str(self.0["bestblockhash"].as_str().unwrap())
@@ -127,7 +127,7 @@ pub struct ListUnspentUtxo {
 pub struct ListUnspentResponse(pub Vec<ListUnspentUtxo>);
 
 impl TryInto<ListUnspentResponse> for JsonResponse {
-	type Error = std::io::Error;
+	type Error = String;
 	fn try_into(self) -> Result<ListUnspentResponse, Self::Error> {
 		let utxos = self
 			.0
