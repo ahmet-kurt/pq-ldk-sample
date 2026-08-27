@@ -262,6 +262,9 @@ impl BitcoindClient {
 			// LDK-based applications should enable RBF bumping and RBF bump either to a local
 			// change address or to a new channel output negotiated with the same node.
 			"replaceable": false,
+			// Lock the selected coins so concurrent channel opens cannot pick the same UTXO
+			// and conflict when both fundings broadcast.
+			"lockUnspents": true,
 		});
 		self.bitcoind_rpc_client
 			.call_method("fundrawtransaction", &[raw_tx_json, options])

@@ -1,4 +1,5 @@
 mod args;
+mod gossip_stats;
 pub mod bitcoind_client;
 mod cli;
 mod convert;
@@ -8,6 +9,7 @@ mod sweep;
 
 use crate::bitcoind_client::BitcoindClient;
 use crate::disk::FilesystemLogger;
+use crate::gossip_stats::GossipStats;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
 use bitcoin::io;
@@ -165,7 +167,7 @@ pub(crate) type GossipVerifier = lightning_block_sync::gossip::GossipVerifier<
 pub(crate) type PeerManager = LdkPeerManager<
 	SocketDescriptor,
 	Arc<ChannelManager>,
-	Arc<P2PGossipSync<Arc<NetworkGraph>, Arc<GossipVerifier>, Arc<FilesystemLogger>>>,
+	Arc<GossipStats>,
 	Arc<OnionMessenger>,
 	Arc<FilesystemLogger>,
 	IgnoringMessageHandler,
@@ -1024,6 +1026,11 @@ async fn start_ldk() {
 		Some(utxo_lookup),
 		Arc::clone(&logger),
 	));
+	let gossip_stats = Arc::new(GossipStats::new(
+		Arc::clone(&gossip_sync),
+		args.gossip_stats,
+		Arc::clone(&logger),
+	));
 
 	// Step 16 an OMDomainResolver as a service to other nodes
 	// As a service to other LDK users, using an `OMDomainResolver` allows others to resolve BIP
@@ -1058,7 +1065,7 @@ async fn start_ldk() {
 	rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
 	let lightning_msg_handler = MessageHandler {
 		chan_handler: Arc::clone(&channel_manager),
-		route_handler: Arc::clone(&gossip_sync),
+		route_handler: Arc::clone(&gossip_stats),
 		onion_message_handler: Arc::clone(&onion_messenger),
 		custom_message_handler: IgnoringMessageHandler {},
 		send_only_message_handler: Arc::clone(&chain_monitor),

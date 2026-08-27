@@ -13,6 +13,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 	let mut pq_require_payments = false;
 	let mut pq_require_inbound = false;
 	let mut pq_blinded_paths = false;
+	let mut gossip_stats = false;
 	let mut args = Vec::new();
 	for arg in env::args() {
 		if let Some(port) = arg.strip_prefix("--pq-listen-port=") {
@@ -23,6 +24,8 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 			pq_require_inbound = true;
 		} else if arg == "--pq-blinded-paths" {
 			pq_blinded_paths = true;
+		} else if arg == "--gossip-stats" {
+			gossip_stats = true;
 		} else if arg.starts_with("--") {
 			println!("ERROR: unknown flag {}", arg);
 			return Err(());
@@ -134,6 +137,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		ldk_announced_listen_addr,
 		ldk_announced_node_name,
 		network,
+		gossip_stats,
 		#[cfg(feature = "post-quantum")]
 		pq_listen_port,
 		#[cfg(feature = "post-quantum")]

@@ -51,6 +51,7 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) ldk_announced_listen_addr: Vec<SocketAddress>,
 	pub(crate) ldk_announced_node_name: [u8; 32],
 	pub(crate) network: Network,
+	pub(crate) gossip_stats: bool,
 	#[cfg(feature = "post-quantum")]
 	pub(crate) pq_listen_port: Option<u16>,
 	#[cfg(feature = "post-quantum")]
@@ -726,6 +727,7 @@ pub(crate) async fn poll_for_user_input(
 				),
 				"listpeers" => list_peers(peer_manager.clone()),
 				"listnodes" => list_nodes(&network_graph),
+				"graphinfo" => graph_info(&network_graph),
 				"announce" => {
 					// Broadcast our node_announcement now instead of waiting for the periodic
 					// timer, useful when testing gossip propagation.
@@ -803,6 +805,7 @@ fn help() {
 	println!("      signmessage <message>");
 	println!("      nodeinfo");
 	println!("      listnodes");
+	println!("      graphinfo");
 	println!("      announce");
 }
 
@@ -883,6 +886,38 @@ fn list_nodes(network_graph: &Arc<NetworkGraph>) {
 		println!("\t}},");
 	}
 	println!("]");
+}
+
+fn graph_info(network_graph: &Arc<NetworkGraph>) {
+	let graph_lock = network_graph.read_only();
+	let announced =
+		graph_lock.nodes().unordered_iter().filter(|(_, n)| n.announcement_info.is_some()).count();
+	let updates: usize = graph_lock
+		.channels()
+		.unordered_iter()
+		.map(|(_, c)| c.one_to_two.is_some() as usize + c.two_to_one.is_some() as usize)
+		.sum();
+	#[cfg(feature = "post-quantum")]
+	{
+		let pinned =
+			graph_lock.nodes().unordered_iter().filter(|(_, n)| n.pq_node_id().is_some()).count();
+		println!(
+			"GRAPHINFO nodes={} announced={} channels={} updates={} pinned={}",
+			graph_lock.nodes().len(),
+			announced,
+			graph_lock.channels().len(),
+			updates,
+			pinned
+		);
+	}
+	#[cfg(not(feature = "post-quantum"))]
+	println!(
+		"GRAPHINFO nodes={} announced={} channels={} updates={}",
+		graph_lock.nodes().len(),
+		announced,
+		graph_lock.channels().len(),
+		updates
+	);
 }
 
 fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<NetworkGraph>) {
