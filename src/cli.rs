@@ -785,7 +785,7 @@ fn help() {
 	println!("      disconnectpeer <peer_pubkey>");
 	println!("      listpeers");
 	println!("\n  Payments:");
-	println!("      sendpayment <invoice|offer|human readable name> [<amount_msat>]");
+	println!("      sendpayment <invoice|offer> [<amount_msat>]");
 	println!("      keysend <dest_pubkey> <amt_msats>");
 	println!("      listpayments");
 	println!("\n  Invoices:");
@@ -1016,24 +1016,40 @@ pub(crate) async fn connect_peer_if_necessary(
 	res
 }
 
+/// Opens a TCP connection to a peer with TCP_NODELAY set, like the listeners in main.rs, so that
+/// every message leaves at once. With Nagle's algorithm, the small commitment_signed that follows
+/// an update_add_htlc waits for the peer's delayed acknowledgment, which adds about 40 ms per hop
+/// on links with a 1500-byte MTU.
+async fn connect_nodelay(peer_addr: SocketAddr) -> Option<std::net::TcpStream> {
+	let connect = async {
+		let stream = tokio::net::TcpStream::connect(peer_addr).await?;
+		stream.set_nodelay(true)?;
+		stream.into_std()
+	};
+	match tokio::time::timeout(Duration::from_secs(10), connect).await {
+		Ok(Ok(stream)) => Some(stream),
+		_ => None,
+	}
+}
+
 pub(crate) async fn do_connect_peer(
 	pubkey: PublicKey, peer_addr: SocketAddr, peer_manager: Arc<PeerManager>,
 ) -> Result<(), ()> {
-	match lightning_net_tokio::connect_outbound(Arc::clone(&peer_manager), pubkey, peer_addr).await
-	{
-		Some(connection_closed_future) => {
-			let mut connection_closed_future = Box::pin(connection_closed_future);
-			loop {
-				tokio::select! {
-					_ = &mut connection_closed_future => return Err(()),
-					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
-				};
-				if peer_manager.peer_by_node_id(&pubkey).is_some() {
-					return Ok(());
-				}
-			}
-		},
-		None => Err(()),
+	let stream = match connect_nodelay(peer_addr).await {
+		Some(stream) => stream,
+		None => return Err(()),
+	};
+	let connection_closed_future =
+		lightning_net_tokio::setup_outbound(Arc::clone(&peer_manager), pubkey, stream);
+	let mut connection_closed_future = Box::pin(connection_closed_future);
+	loop {
+		tokio::select! {
+			_ = &mut connection_closed_future => return Err(()),
+			_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+		};
+		if peer_manager.peer_by_node_id(&pubkey).is_some() {
+			return Ok(());
+		}
 	}
 }
 
@@ -1042,27 +1058,25 @@ async fn do_connect_peer_pq(
 	pubkey: PublicKey, kem_key: [u8; lightning::ln::peer_handler::PQ_KEM_EK_LEN],
 	peer_addr: SocketAddr, peer_manager: Arc<PeerManager>,
 ) -> Result<(), ()> {
-	match lightning_net_tokio::connect_outbound_pq(
+	let stream = match connect_nodelay(peer_addr).await {
+		Some(stream) => stream,
+		None => return Err(()),
+	};
+	let connection_closed_future = lightning_net_tokio::setup_outbound_pq(
 		Arc::clone(&peer_manager),
 		pubkey,
 		kem_key,
-		peer_addr,
-	)
-	.await
-	{
-		Some(connection_closed_future) => {
-			let mut connection_closed_future = Box::pin(connection_closed_future);
-			loop {
-				tokio::select! {
-					_ = &mut connection_closed_future => return Err(()),
-					_ = tokio::time::sleep(Duration::from_millis(10)) => {},
-				};
-				if peer_manager.peer_by_node_id(&pubkey).is_some() {
-					return Ok(());
-				}
-			}
-		},
-		None => Err(()),
+		stream,
+	);
+	let mut connection_closed_future = Box::pin(connection_closed_future);
+	loop {
+		tokio::select! {
+			_ = &mut connection_closed_future => return Err(()),
+			_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+		};
+		if peer_manager.peer_by_node_id(&pubkey).is_some() {
+			return Ok(());
+		}
 	}
 }
 

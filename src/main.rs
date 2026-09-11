@@ -1092,6 +1092,10 @@ async fn start_ldk() {
 		loop {
 			let peer_mgr = peer_manager_connection_handler.clone();
 			let tcp_stream = listener.accept().await.unwrap().0;
+			// Send every message at once. With Nagle's algorithm, the small commitment_signed that
+			// follows an update_add_htlc waits for the peer's delayed acknowledgment, which adds
+			// about 40 ms per hop on links with a 1500-byte MTU.
+			let _ = tcp_stream.set_nodelay(true);
 			if stop_listen.load(Ordering::Acquire) {
 				return;
 			}
@@ -1120,6 +1124,7 @@ async fn start_ldk() {
 			loop {
 				let peer_mgr = peer_manager_connection_handler.clone();
 				let tcp_stream = listener.accept().await.unwrap().0;
+				let _ = tcp_stream.set_nodelay(true);
 				if stop_listen.load(Ordering::Acquire) {
 					return;
 				}
